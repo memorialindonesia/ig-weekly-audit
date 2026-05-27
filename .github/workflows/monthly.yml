@@ -1,1 +1,39 @@
+name: IG Monthly Audit (30d)
 
+on:
+  schedule:
+    # Tanggal 1 setiap bulan, 02:00 UTC = 09:00 WIB
+    - cron: '0 2 1 * *'
+  workflow_dispatch:  # manual trigger via GitHub UI
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run monthly audit
+        env:
+          APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          WINDOW_DAYS: '30'
+        run: python audit.py
+
+      - name: Archive snapshot + PDF
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: monthly-audit-${{ github.run_id }}
+          path: |
+            ig-monthly-audit-*.pdf
+            snapshot-monthly-*.json
+          retention-days: 365
