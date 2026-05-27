@@ -1,4 +1,4 @@
-name: IG Weekly Audit (7d)
+name: IG Audit (Weekly + Monthly Rolling)
 
 on:
   schedule:
@@ -9,7 +9,7 @@ on:
 jobs:
   audit:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
@@ -21,19 +21,20 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run weekly audit
+      - name: Run audit (generates both weekly + monthly)
         env:
           APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
-          WINDOW_DAYS: '7'
         run: python audit.py
 
-      - name: Archive snapshot + PDF
+      - name: Archive snapshots + PDFs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: weekly-audit-${{ github.run_id }}
+          name: audit-${{ github.run_id }}
           path: |
             ig-weekly-audit-*.pdf
+            ig-monthly-audit-*.pdf
             snapshot-weekly-*.json
-          retention-days: 90
+            snapshot-monthly-*.json
+          retention-days: 365
