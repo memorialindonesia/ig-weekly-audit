@@ -1,18 +1,24 @@
 """
-IG Weekly Audit — runs in GitHub Actions every Monday 09:00 WIB.
+IG Audit — runs in GitHub Actions.
+
+Dual mode:
+- WINDOW_DAYS=7  → Weekly (Senin 09:00 WIB) via weekly.yml
+- WINDOW_DAYS=30 → Monthly (tgl 1 setiap bulan 09:00 WIB) via monthly.yml
 
 Pipeline:
-1. Fetch profile + recent posts dari Apify Instagram Profile Scraper untuk 8 akun
-2. Filter post yang ada di window 7 hari terakhir
+1. Fetch profile + recent posts dari Apify Instagram Profile Scraper untuk 13 akun
+2. Filter post yang ada di window N hari terakhir
 3. Hitung scoreboard, top 3, format mix, ER
-4. Generate PDF (colorful, mirip versi manual)
+4. Generate PDF (colorful)
 5. POST summary + PDF ke Discord webhook
+6. Archive snapshot JSON sebagai GitHub Actions artifact
 
 Required env vars:
 - APIFY_TOKEN: dari https://console.apify.com/account/integrations
 - DISCORD_WEBHOOK: webhook URL channel target
+- WINDOW_DAYS (optional, default 7): 7 atau 30
 
-Run locally: python audit.py
+Run locally: WINDOW_DAYS=7 python audit.py
 """
 
 import os
@@ -24,23 +30,47 @@ import requests
 
 APIFY_TOKEN = os.environ["APIFY_TOKEN"]
 DISCORD_WEBHOOK = os.environ["DISCORD_WEBHOOK"]
+WINDOW_DAYS = int(os.environ.get("WINDOW_DAYS", "7"))
+
+# Report mode derived from window
+if WINDOW_DAYS == 7:
+    REPORT_MODE = "weekly"
+    REPORT_LABEL = "Weekly Audit"
+    APIFY_RESULTS_LIMIT = 30
+elif WINDOW_DAYS == 30:
+    REPORT_MODE = "monthly"
+    REPORT_LABEL = "Monthly Audit"
+    APIFY_RESULTS_LIMIT = 100  # need more posts for 30d window
+else:
+    REPORT_MODE = f"{WINDOW_DAYS}d"
+    REPORT_LABEL = f"{WINDOW_DAYS}-Day Audit"
+    APIFY_RESULTS_LIMIT = max(30, WINDOW_DAYS * 3)
 
 # Account roster — edit sesuai kebutuhan
+# Agent al azhar memorial tampilkan terpisah, jangan di-sum
 ROSTER = {
+    # Corporate (2)
     "alazharmemorialgarden": "corporate",
     "lestari.memorialpark": "corporate",
-    "alazharmemorialpark": "agent",
+    # Agent Al Azhar Memorial group (3) — tetap terpisah
+    "alazhar_memorial": "agent",
     "alazharpemakamanmuslim": "agent",
+    "alazhar.memorial": "agent",
+    # Competitor (8)
     "insiramemorialpark": "competitor",
     "firdausmemorialpark": "competitor",
     "baqimemorialpark.bogor": "competitor",
     "dt.memorialpark": "competitor",
+    "sandiegohills": "competitor",
+    "marketing_sandiegohills": "competitor",
+    "sandiegohillsgallery": "competitor",
+    "graha.sentosa": "competitor",
 }
 
 # WIB timezone (UTC+7)
 WIB = timezone(timedelta(hours=7))
 NOW = datetime.now(WIB)
-WINDOW_START = NOW - timedelta(days=7)
+WINDOW_START = NOW - timedelta(days=WINDOW_DAYS)
 RUN_DATE = NOW.strftime("%Y-%m-%d")
 
 
@@ -49,15 +79,15 @@ def fetch_apify(usernames):
     url = f"https://api.apify.com/v2/acts/apify~instagram-profile-scraper/run-sync-get-dataset-items?token={APIFY_TOKEN}"
     payload = {
         "usernames": usernames,
-        "resultsLimit": 30,  # posts per profile
+        "resultsLimit": APIFY_RESULTS_LIMIT,
     }
-    r = requests.post(url, json=payload, timeout=600)
+    r = requests.post(url, json=payload, timeout=900)
     r.raise_for_status()
     return r.json()
 
 
 def classify(profile):
-    """Group profile data + filter posts to 7-day window."""
+    """Group profile data + filter posts to window."""
     username = profile.get("username", "")
     status = ROSTER.get(username, "unknown")
     follower_count = profile.get("followersCount", 0)
@@ -71,12 +101,12 @@ def classify(profile):
         post_dt = datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone(WIB)
         if post_dt < WINDOW_START:
             continue
-        fmt = p.get("type", "").lower()  # "Image", "Video", "Sidecar"
+        fmt = (p.get("type") or "").lower()
         format_str = {"video": "reel", "sidecar": "carousel", "image": "static"}.get(fmt, "static")
         recent_posts.append({
             "shortcode": p.get("shortCode") or p.get("shortcode"),
             "format": format_str,
-            "caption": (p.get("caption") or "")[:120],
+            "caption": (p.get("caption") or "")[:140],
             "likes": p.get("likesCount", 0) or 0,
             "comments": p.get("commentsCount", 0) or 0,
             "views": p.get("videoViewCount") or p.get("videoPlayCount") or 0,
@@ -91,8 +121,8 @@ def classify(profile):
         "status": status,
         "followers": follower_count,
         "posts_total": posts_total,
-        "posts_7d": recent_posts,
-        "eng_7d": eng_total,
+        "posts_window": recent_posts,
+        "eng_window": eng_total,
         "er": er,
     }
 
@@ -101,7 +131,7 @@ def compute_insights(data):
     """Top 3 cross-account + format winners."""
     all_posts = []
     for d in data:
-        for p in d["posts_7d"]:
+        for p in d["posts_window"]:
             all_posts.append({**p, "account": d["username"], "status": d["status"]})
 
     all_posts_sorted = sorted(all_posts, key=lambda p: p["likes"] + p["comments"], reverse=True)
@@ -121,24 +151,25 @@ def compute_insights(data):
 
 def build_summary(data, top3, fmt_winners):
     """Discord message — markdown, ≤2000 chars."""
-    by_status = defaultdict(list)
-    for d in data:
-        by_status[d["status"]].append(d)
-
-    lines = [f"**📊 IG Weekly Audit — {RUN_DATE}**"]
-    lines.append(f"Window: {WINDOW_START.strftime('%Y-%m-%d')} → {NOW.strftime('%Y-%m-%d')} · 2 corporate · 2 agent · 4 competitor")
+    icon = "📅" if REPORT_MODE == "weekly" else "🗓️"
+    lines = [f"**{icon} IG {REPORT_LABEL} — {RUN_DATE}**"]
+    lines.append(f"Window: {WINDOW_START.strftime('%Y-%m-%d')} → {NOW.strftime('%Y-%m-%d')} ({WINDOW_DAYS}d) · "
+                 f"2 corporate · 3 agent · 8 competitor")
     lines.append("")
-    lines.append("**🎯 KEY SIGNALS**")
-    sorted_data = sorted(data, key=lambda d: d["eng_7d"], reverse=True)
+    lines.append(f"**🎯 TOP 3 AKUN BY ENGAGEMENT ({WINDOW_DAYS}d)**")
+    sorted_data = sorted(data, key=lambda d: d["eng_window"], reverse=True)
     for d in sorted_data[:3]:
         emoji = {"corporate": "🏢", "agent": "👥", "competitor": "🔴"}[d["status"]]
-        lines.append(f"{emoji} @{d['username']} — {d['eng_7d']} eng / {len(d['posts_7d'])} posts (ER {d['er']:.2f}%)")
-    dormant = [d for d in data if len(d["posts_7d"]) == 0]
+        lines.append(f"{emoji} @{d['username']} — {d['eng_window']} eng / {len(d['posts_window'])} posts (ER {d['er']:.2f}%)")
+
+    dormant = [d for d in data if len(d["posts_window"]) == 0]
     if dormant:
-        lines.append(f"⚠ Dormant 7d: {', '.join('@' + d['username'] for d in dormant)}")
+        names = ", ".join("@" + d["username"] for d in dormant[:5])
+        suffix = f" (+{len(dormant)-5} lain)" if len(dormant) > 5 else ""
+        lines.append(f"\n⚠ Dormant {WINDOW_DAYS}d ({len(dormant)} akun): {names}{suffix}")
 
     lines.append("")
-    lines.append("**🏆 TOP POST MINGGU INI**")
+    lines.append("**🏆 TOP POST**")
     if top3:
         t = top3[0]
         lines.append(f"@{t['account']} — {t['format'].upper()} — **{t['likes']}♥ / {t['comments']}💬**")
@@ -151,12 +182,12 @@ def build_summary(data, top3, fmt_winners):
         ratio = r_avg / s_avg if s_avg else 0
         lines.append(f"📈 Format: Reel avg {r_avg:.1f} vs Static avg {s_avg:.1f} ({ratio:.1f}× lebih efektif)")
 
-    lines.append("\n📎 Detail lengkap di PDF attached.")
+    lines.append(f"\n📎 Detail lengkap di PDF attached.")
     return "\n".join(lines)[:1900]
 
 
 def build_pdf(data, top3, all_posts, out_path):
-    """Colorful PDF report — same style as manual version."""
+    """Colorful PDF report."""
     from reportlab.lib.pagesizes import A4
     from reportlab.lib.styles import ParagraphStyle
     from reportlab.lib.units import cm
@@ -186,19 +217,20 @@ def build_pdf(data, top3, all_posts, out_path):
     thdr = ParagraphStyle("TH", fontName="Helvetica-Bold", fontSize=8, leading=10,
                           textColor=colors.white)
 
-    status_color = {"corporate": CORP, "agent": AGENT, "competitor": COMP}
+    status_color = {"corporate": CORP, "agent": AGENT, "competitor": COMP, "unknown": MUTED}
 
     doc = SimpleDocTemplate(out_path, pagesize=A4,
                             leftMargin=1.2 * cm, rightMargin=1.2 * cm,
                             topMargin=1.5 * cm, bottomMargin=1.5 * cm)
-    story = [Paragraph(f"IG Weekly Audit — {RUN_DATE}", h1)]
+    story = [Paragraph(f"IG {REPORT_LABEL} — {RUN_DATE}", h1)]
     story.append(Paragraph(
-        f"Window {WINDOW_START.strftime('%Y-%m-%d')} → {NOW.strftime('%Y-%m-%d')} · automated", small))
+        f"Window {WINDOW_START.strftime('%Y-%m-%d')} → {NOW.strftime('%Y-%m-%d')} "
+        f"({WINDOW_DAYS}d) · automated via GitHub Actions", small))
     story.append(Spacer(1, 8))
 
     # Scoreboard
     story.append(Paragraph("Scoreboard", h2))
-    rows = [["Akun", "Status", "Followers", "Posts 7d", "Eng. 7d", "ER %"]]
+    rows = [["Akun", "Status", "Followers", f"Posts {WINDOW_DAYS}d", f"Eng. {WINDOW_DAYS}d", "ER %"]]
     sorted_data = sorted(data, key=lambda d: d["followers"], reverse=True)
     for d in sorted_data:
         c = status_color.get(d["status"], MUTED)
@@ -206,8 +238,8 @@ def build_pdf(data, top3, all_posts, out_path):
             Paragraph(f"@{d['username']}", tcell),
             Paragraph(f"<font color='{c.hexval()}'><b>● {d['status']}</b></font>", tcell),
             Paragraph(f"{d['followers']:,}", tcell),
-            Paragraph(str(len(d['posts_7d'])), tcell),
-            Paragraph(str(d['eng_7d']), tcell),
+            Paragraph(str(len(d['posts_window'])), tcell),
+            Paragraph(str(d['eng_window']), tcell),
             Paragraph(f"{d['er']:.2f}%", tcell),
         ])
     t = Table([[Paragraph(c, thdr) if i == 0 and isinstance(c, str) else c for c in r]
@@ -224,9 +256,8 @@ def build_pdf(data, top3, all_posts, out_path):
     story.append(t)
 
     # Top 3
-    story.append(Paragraph("🏆 Top 3 Posts 7d (cross-account)", h2))
+    story.append(Paragraph(f"🏆 Top 3 Posts {WINDOW_DAYS}d (cross-account)", h2))
     for i, p in enumerate(top3, 1):
-        eng = p["likes"] + p["comments"]
         story.append(Paragraph(
             f"<b>#{i}</b> @{p['account']} · {p['format'].upper()} · "
             f"<b>{p['likes']}♥ / {p['comments']}💬</b> · {p['date']}",
@@ -236,18 +267,18 @@ def build_pdf(data, top3, all_posts, out_path):
         story.append(Spacer(1, 4))
 
     # Per-akun detail
-    story.append(Paragraph("Per-akun detail (7 hari)", h2))
+    story.append(Paragraph(f"Per-akun detail ({WINDOW_DAYS} hari)", h2))
     for d in sorted_data:
-        if not d["posts_7d"]:
+        if not d["posts_window"]:
             continue
         c = status_color.get(d["status"], MUTED)
         story.append(Paragraph(
             f"<font color='{c.hexval()}'><b>@{d['username']}</b></font> · "
-            f"{d['status']} · {len(d['posts_7d'])} posts · {d['eng_7d']} eng · ER {d['er']:.2f}%",
+            f"{d['status']} · {len(d['posts_window'])} posts · {d['eng_window']} eng · ER {d['er']:.2f}%",
             ParagraphStyle("ah", fontName="Helvetica-Bold", fontSize=9.5, leading=12,
                           textColor=INK, spaceBefore=6, spaceAfter=3)))
         post_rows = [["Tgl", "Format", "Caption", "♥", "💬"]]
-        for p in d["posts_7d"]:
+        for p in d["posts_window"]:
             post_rows.append([
                 p["date"], p["format"], p["caption"][:80],
                 str(p["likes"]), str(p["comments"])
@@ -265,16 +296,17 @@ def build_pdf(data, top3, all_posts, out_path):
         ]))
         story.append(t)
 
-    dormant = [d for d in data if not d["posts_7d"]]
+    dormant = [d for d in data if not d["posts_window"]]
     if dormant:
         story.append(Paragraph(
-            f"<b>Dormant 7d:</b> " + ", ".join(f"@{d['username']}" for d in dormant), small))
+            f"<b>Dormant {WINDOW_DAYS}d ({len(dormant)} akun):</b> " +
+            ", ".join(f"@{d['username']}" for d in dormant), small))
 
     doc.build(story)
 
 
 def post_discord(summary, pdf_path):
-    payload = {"username": "IG Weekly Audit Bot", "content": summary}
+    payload = {"username": "IG Audit Bot", "content": summary}
     with open(pdf_path, "rb") as f:
         r = requests.post(
             DISCORD_WEBHOOK,
@@ -287,9 +319,10 @@ def post_discord(summary, pdf_path):
 
 
 def main():
+    print(f"Mode: {REPORT_MODE} (WINDOW_DAYS={WINDOW_DAYS})")
     print(f"Run date: {RUN_DATE} WIB")
     print(f"Window: {WINDOW_START} → {NOW}")
-    print(f"Fetching {len(ROSTER)} profiles from Apify...")
+    print(f"Fetching {len(ROSTER)} profiles from Apify (resultsLimit={APIFY_RESULTS_LIMIT})...")
 
     raw = fetch_apify(list(ROSTER.keys()))
     print(f"Got {len(raw)} profile records")
@@ -302,14 +335,16 @@ def main():
     print(summary)
     print("---\n")
 
-    pdf_path = f"ig-weekly-audit-{RUN_DATE}.pdf"
+    pdf_path = f"ig-{REPORT_MODE}-audit-{RUN_DATE}.pdf"
     build_pdf(data, top3, all_posts, pdf_path)
     print(f"PDF built: {pdf_path}")
 
-    # Snapshot JSON untuk historical record
-    snap_path = f"snapshot-{RUN_DATE}.json"
+    # Snapshot JSON
+    snap_path = f"snapshot-{REPORT_MODE}-{RUN_DATE}.json"
     with open(snap_path, "w") as f:
-        json.dump({"run_date": RUN_DATE, "accounts": data}, f, indent=2, default=str)
+        json.dump({"run_date": RUN_DATE, "mode": REPORT_MODE,
+                   "window_days": WINDOW_DAYS, "accounts": data},
+                  f, indent=2, default=str)
     print(f"Snapshot saved: {snap_path}")
 
     post_discord(summary, pdf_path)
