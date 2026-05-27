@@ -1,4 +1,4 @@
-name: IG Weekly Audit
+name: IG Weekly Audit (7d)
 
 on:
   schedule:
@@ -21,18 +21,19 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run audit
+      - name: Run weekly audit
         env:
           APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          WINDOW_DAYS: '7'
         run: python audit.py
 
       - name: Archive snapshot + PDF
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: audit-output-${{ github.run_id }}
+          name: weekly-audit-${{ github.run_id }}
           path: |
             ig-weekly-audit-*.pdf
-            snapshot-*.json
+            snapshot-weekly-*.json
           retention-days: 90
