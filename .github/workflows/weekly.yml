@@ -2,7 +2,8 @@ name: IG Audit (Weekly + Monthly Rolling)
 
 on:
   schedule:
-    - cron: '0 1 * * 1'   # ← ganti dari '0 2 * * 1'
+    # Senin 02:00 UTC = 09:00 WIB
+    - cron: '0 2 * * 1'
   workflow_dispatch:  # manual trigger via GitHub UI
 
 jobs:
