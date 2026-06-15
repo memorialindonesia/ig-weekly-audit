@@ -1,10 +1,14 @@
-# IG Audit Automation — Weekly + Monthly via 1 Cron
+# IG Audit Automation — Weekly + Monthly via 1 Cron, dengan detail layer
 
-Otomatis fetch data IG **14 akun** setiap Senin 09:00 WIB, generate **2 PDF dalam 1 trigger** (analisis 7 hari + 30 hari), kirim ke Discord.
+Otomatis fetch data IG **14 akun** setiap Senin 09:00 WIB, generate **2 PDF dalam 1 trigger** (analisis 7 hari + 30 hari) **+ 3 detail layer**, kirim ke Discord.
 
 **Konfigurasi:**
 - **1 cron** (Senin 09:00 WIB)
 - **2 analisis output:** weekly (7d) + monthly rolling (30d)
+- **3 detail layers:**
+  - 🎬 Reels deep metrics (plays, plays-to-likes ratio, audio trends) — setiap minggu
+  - 💬 Comments + sentiment (5 top competitor posts, lead detection) — setiap minggu
+  - 🏷️ Hashtag market tracking (5 key hashtags) — **hanya 1× per bulan (first Monday)**
 - Setiap Senin pagi Discord dapat 1 message dengan 2 PDF attached
 
 ## Roster (14 akun)
@@ -52,13 +56,21 @@ Di repo: **Settings → Secrets and variables → Actions**
 ### 6. Done — Senin pagi otomatis jalan
 
 ## Cost estimasi
-| Item | Cost |
+| Item | Cost/bulan |
 |---|---|
-| GitHub Actions (private repo) | $0 (4 run × ~4 min = 16 min/bulan, jauh di bawah 2000 min free) |
-| Apify Instagram Profile Scraper | ~$2.80/bulan (14 akun × $0.05 × 4 run) |
-| **Total** | **~$2.80/bulan** |
+| GitHub Actions (private repo) | $0 (free tier) |
+| Profile scraper (14 akun × 4 run) | ~$2.80 |
+| Reels deep metrics (8 competitor × 5 reels × 4 run) | ~$8 |
+| Comments + sentiment (5 top posts × 4 run) | ~$6 |
+| Hashtag tracking (5 hashtag × 1 run/month, first Monday only) | ~$4 |
+| **Total** | **~$17–20/bulan** |
 
-Apify trial $5 cukup untuk ~1.8 bulan pertama.
+Apify trial $5 cukup untuk ~1 minggu pertama. Setelah itu pay-as-you-go (top up $20 = 1 bulan).
+
+**Cost control:**
+- Reels + Comments hanya untuk **competitor (8 akun)**, bukan corporate/agent
+- Hashtag hanya jalan **first Monday of month** — script auto-skip kalau bukan tanggal 1-7 yang Senin
+- Edit `HASHTAGS = [...]` di audit.py untuk ubah list hashtag yang di-track
 
 ## Cara modifikasi
 
