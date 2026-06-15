@@ -1,16 +1,22 @@
 """
 IG Audit — runs in GitHub Actions every Monday 09:00 WIB.
 
-Single trigger, dual report:
+Single trigger, dual report + detail layers:
 - Weekly (7d window) — what happened minggu lalu
 - Monthly rolling (30d window) — trend overview 1 bulan terakhir
+- DETAIL LAYERS (competitor only): Reels deep metrics + Comments sentiment
+- HASHTAG TRACKING — only first Monday of month (cost control)
 
 Pipeline:
-1. Fetch profile + 100 latest posts dari Apify Instagram Profile Scraper untuk 13 akun (sekali)
-2. Filter dua kali: posts dalam 7d window + 30d window
-3. Untuk masing-masing window: scoreboard, top 3, format mix, ER → generate PDF
-4. POST keduanya ke Discord webhook dalam satu message (2 PDF attached)
-5. Archive snapshots sebagai GitHub Actions artifact
+1. Fetch profile + 100 posts (apify/instagram-profile-scraper) — 14 akun
+2. Fetch reels deep metrics (apify/instagram-reel-scraper) — 8 competitor only, top 5 reels each
+3. Fetch comments for top 5 cross-competitor posts (apify/instagram-post-scraper)
+4. (Monthly only) Fetch hashtag stats (apify/instagram-hashtag-scraper) — 5 key hashtags
+5. Filter dua kali: posts dalam 7d + 30d window
+6. Generate 2 PDF (weekly + monthly), POST ke Discord webhook
+7. Archive snapshots sebagai GitHub Actions artifact
+
+Cost: ~$17/bulan (4 weekly runs + 1 hashtag run)
 
 Required env vars:
 - APIFY_TOKEN: dari https://console.apify.com/account/integrations
@@ -29,6 +35,18 @@ import requests
 APIFY_TOKEN = os.environ["APIFY_TOKEN"]
 DISCORD_WEBHOOK = os.environ["DISCORD_WEBHOOK"]
 APIFY_RESULTS_LIMIT = 100  # cover 30d untuk akun aktif
+REELS_PER_COMPETITOR = 5  # top reels per competitor
+TOP_POSTS_FOR_COMMENTS = 5  # cross-competitor top posts to fetch comments
+COMMENTS_PER_POST = 30  # comments per post sample
+
+# Hashtag list untuk monthly tracking — edit sesuai strategy
+HASHTAGS = [
+    "pemakamanmuslim",
+    "pemakamansyariah",
+    "wakaf",
+    "akhiryangbaik",
+    "memorialpark",
+]
 
 # Account roster — edit sesuai kebutuhan
 # Agent al azhar memorial tampilkan terpisah, jangan di-sum
@@ -58,13 +76,146 @@ NOW = datetime.now(WIB)
 RUN_DATE = NOW.strftime("%Y-%m-%d")
 
 
-def fetch_apify(usernames):
-    """Sekali fetch — 100 latest posts per akun, cukup untuk 30d window."""
-    url = f"https://api.apify.com/v2/acts/apify~instagram-profile-scraper/run-sync-get-dataset-items?token={APIFY_TOKEN}"
-    payload = {"usernames": usernames, "resultsLimit": APIFY_RESULTS_LIMIT}
-    r = requests.post(url, json=payload, timeout=900)
+def call_apify_actor(actor_id, payload, timeout=900):
+    """Generic Apify actor caller."""
+    url = f"https://api.apify.com/v2/acts/{actor_id}/run-sync-get-dataset-items?token={APIFY_TOKEN}"
+    r = requests.post(url, json=payload, timeout=timeout)
     r.raise_for_status()
     return r.json()
+
+
+def fetch_apify(usernames):
+    """Profile scraper — 100 latest posts per akun, cukup untuk 30d window."""
+    return call_apify_actor("apify~instagram-profile-scraper", {
+        "usernames": usernames,
+        "resultsLimit": APIFY_RESULTS_LIMIT,
+    })
+
+
+def fetch_reels_metrics(competitor_usernames):
+    """Reel deep metrics — top reels per competitor account.
+    Returns: dict {username: [reel_data, ...]}
+    Cost: ~$0.05 per reel × 5 × 8 = $2/run."""
+    print(f"Fetching reels deep metrics for {len(competitor_usernames)} competitors...")
+    try:
+        raw = call_apify_actor("apify~instagram-reel-scraper", {
+            "username": competitor_usernames,
+            "resultsLimit": REELS_PER_COMPETITOR,
+        })
+    except Exception as e:
+        print(f"⚠ Reels fetch failed: {e}")
+        return {}
+
+    grouped = defaultdict(list)
+    for r in raw:
+        owner = r.get("ownerUsername") or r.get("username")
+        if not owner:
+            continue
+        plays = r.get("videoPlayCount") or r.get("videoViewCount") or 0
+        likes = r.get("likesCount", 0) or 0
+        grouped[owner].append({
+            "shortcode": r.get("shortCode"),
+            "caption": (r.get("caption") or "")[:120],
+            "plays": plays,
+            "likes": likes,
+            "comments": r.get("commentsCount", 0) or 0,
+            "duration": r.get("videoDuration", 0) or 0,
+            "audio_title": r.get("musicInfo", {}).get("song_name") if r.get("musicInfo") else None,
+            "audio_artist": r.get("musicInfo", {}).get("artist_name") if r.get("musicInfo") else None,
+            "plays_to_likes": (likes / plays * 100) if plays else 0,
+        })
+    return dict(grouped)
+
+
+def fetch_post_comments(top_post_urls):
+    """Comments + basic sentiment untuk top posts cross-competitor.
+    Returns: dict {post_url: [comment_data, ...]}
+    Cost: ~$0.30 per post × 5 = $1.50/run."""
+    if not top_post_urls:
+        return {}
+    print(f"Fetching comments for {len(top_post_urls)} top posts...")
+    try:
+        raw = call_apify_actor("apify~instagram-comment-scraper", {
+            "directUrls": top_post_urls,
+            "resultsLimit": COMMENTS_PER_POST,
+        })
+    except Exception as e:
+        print(f"⚠ Comments fetch failed: {e}")
+        return {}
+
+    grouped = defaultdict(list)
+    for c in raw:
+        post_url = c.get("postUrl") or c.get("ownerUsername")
+        text = (c.get("text") or "").strip()
+        if not text:
+            continue
+        grouped[post_url].append({
+            "text": text[:200],
+            "author": c.get("ownerUsername"),
+            "likes": c.get("likesCount", 0) or 0,
+            "sentiment": classify_sentiment(text),
+        })
+    return dict(grouped)
+
+
+def classify_sentiment(text):
+    """Simple keyword-based sentiment. Bukan LLM — fast + free.
+    Untuk full LLM sentiment, integrate Anthropic API call."""
+    t = text.lower()
+    POSITIVE = ["bagus", "indah", "amin", "barakallah", "terima kasih", "mantap",
+                "🥰", "❤", "🤍", "💚", "🙏", "amazing", "love", "👍"]
+    NEGATIVE = ["mahal", "ga jelas", "kurang", "kecewa", "nggak", "tidak",
+                "😢", "😡", "buruk", "scam"]
+    LEAD = ["berapa", "harga", "dm", "wa", "info", "kontak", "pesan",
+            "konsultasi", "kavling", "tipe"]
+    SPAM = ["follow back", "follback", "fb", "spam", "promo", "shopee", "tokped"]
+
+    if any(k in t for k in SPAM):
+        return "spam"
+    if any(k in t for k in LEAD):
+        return "lead"
+    if any(k in t for k in POSITIVE):
+        return "positive"
+    if any(k in t for k in NEGATIVE):
+        return "negative"
+    return "neutral"
+
+
+def is_first_monday_of_month():
+    """Check if today is first Monday of the month (untuk hashtag tracking)."""
+    return NOW.weekday() == 0 and NOW.day <= 7
+
+
+def fetch_hashtag_stats(hashtags):
+    """Hashtag tracking — top posts + reach per hashtag.
+    Only runs first Monday of month untuk cost control.
+    Cost: ~$0.80/hashtag × 5 = $4/month."""
+    if not is_first_monday_of_month():
+        print("Skipping hashtag tracking — not first Monday of month")
+        return {}
+    print(f"Fetching hashtag stats for {len(hashtags)} hashtags...")
+    try:
+        raw = call_apify_actor("apify~instagram-hashtag-scraper", {
+            "hashtags": hashtags,
+            "resultsLimit": 20,  # top 20 posts per hashtag
+        })
+    except Exception as e:
+        print(f"⚠ Hashtag fetch failed: {e}")
+        return {}
+
+    grouped = defaultdict(list)
+    for p in raw:
+        tag = p.get("hashtag") or p.get("query")
+        if not tag:
+            continue
+        grouped[tag].append({
+            "shortcode": p.get("shortCode"),
+            "owner": p.get("ownerUsername"),
+            "likes": p.get("likesCount", 0) or 0,
+            "comments": p.get("commentsCount", 0) or 0,
+            "caption": (p.get("caption") or "")[:100],
+        })
+    return dict(grouped)
 
 
 def parse_post(p):
@@ -185,8 +336,9 @@ def build_discord_summary(weekly, monthly):
     return "\n".join(lines)[:1900]
 
 
-def build_pdf(data, top3, window_days, label, out_path):
-    """Colorful PDF report."""
+def build_pdf(data, top3, window_days, label, out_path,
+              reels_detail=None, comments_detail=None, hashtag_detail=None):
+    """Colorful PDF report. Detail sections rendered jika data tersedia."""
     from reportlab.lib.pagesizes import A4
     from reportlab.lib.styles import ParagraphStyle
     from reportlab.lib.units import cm
@@ -296,6 +448,99 @@ def build_pdf(data, top3, window_days, label, out_path):
         story.append(Paragraph(
             f"<b>Dormant {window_days}d ({len(dormant)} akun):</b> " +
             ", ".join(f"@{d['username']}" for d in dormant), small))
+
+    # ─── DETAIL LAYER 1: Reels deep metrics ──────────────────────────
+    if reels_detail:
+        story.append(Paragraph("🎬 Reels Deep Metrics (competitor)", h2))
+        rd_rows = [["Akun", "Reel snippet", "Plays", "Likes", "P:L %", "Audio"]]
+        for username, reels in reels_detail.items():
+            # Sort by plays desc, take top 3 per akun
+            top_reels = sorted(reels, key=lambda r: r["plays"], reverse=True)[:3]
+            for r in top_reels:
+                audio = f"{r['audio_title']} – {r['audio_artist']}" if r['audio_title'] else "Original"
+                rd_rows.append([
+                    f"@{username}",
+                    r["caption"][:60],
+                    f"{r['plays']:,}",
+                    str(r["likes"]),
+                    f"{r['plays_to_likes']:.1f}%",
+                    audio[:35]
+                ])
+        t = Table([[Paragraph(x, thdr) if i == 0 and isinstance(x, str) else Paragraph(str(x), tcell)
+                    for x in row] for i, row in enumerate(rd_rows)],
+                  colWidths=[3 * cm, 5.5 * cm, 2 * cm, 1.5 * cm, 1.5 * cm, 4 * cm])
+        t.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), COMP),
+            ("GRID", (0, 0), (-1, -1), 0.2, HAIR),
+            ("FONTSIZE", (0, 0), (-1, -1), 7),
+            ("TOPPADDING", (0, 0), (-1, -1), 3),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, LIGHT_BG]),
+        ]))
+        story.append(t)
+
+    # ─── DETAIL LAYER 2: Comments + sentiment ──────────────────────
+    if comments_detail:
+        story.append(Paragraph("💬 Top Posts — Comments + Sentiment", h2))
+        for post_url, comments in comments_detail.items():
+            sent_count = defaultdict(int)
+            for c in comments:
+                sent_count[c["sentiment"]] += 1
+            leads = [c for c in comments if c["sentiment"] == "lead"]
+            negative = [c for c in comments if c["sentiment"] == "negative"]
+
+            story.append(Paragraph(
+                f"<b>{post_url[-30:]}</b> · "
+                f"<font color='#16A34A'>+{sent_count['positive']}</font> · "
+                f"<font color='#DC2626'>-{sent_count['negative']}</font> · "
+                f"<font color='#0891B2'>leads {sent_count['lead']}</font> · "
+                f"neutral {sent_count['neutral']} · spam {sent_count['spam']}",
+                ParagraphStyle("ch", fontName="Helvetica-Bold", fontSize=8.5,
+                              leading=11, textColor=INK, spaceBefore=4, spaceAfter=2)))
+            if leads:
+                story.append(Paragraph("<b>Lead signals:</b>", small))
+                for c in leads[:3]:
+                    story.append(Paragraph(
+                        f"• @{c['author']}: <i>{c['text'][:120]}</i>",
+                        ParagraphStyle("cl", fontName="Helvetica", fontSize=7.5,
+                                      leading=10, textColor=INK, leftIndent=6)))
+            if negative:
+                story.append(Paragraph("<b>Negative:</b>", small))
+                for c in negative[:2]:
+                    story.append(Paragraph(
+                        f"• @{c['author']}: <i>{c['text'][:120]}</i>",
+                        ParagraphStyle("cn", fontName="Helvetica", fontSize=7.5,
+                                      leading=10, textColor=colors.HexColor("#B45309"),
+                                      leftIndent=6)))
+
+    # ─── DETAIL LAYER 3: Hashtag tracking (monthly only) ───────────
+    if hashtag_detail:
+        story.append(Paragraph("🏷️ Hashtag Market — Top Posts per Tag", h2))
+        ht_rows = [["Hashtag", "Owner", "Likes", "Cmt", "Caption snippet"]]
+        for tag, posts in hashtag_detail.items():
+            top_posts = sorted(posts, key=lambda p: p["likes"] + p["comments"],
+                              reverse=True)[:3]
+            for p in top_posts:
+                is_competitor = p["owner"] in ROSTER and ROSTER[p["owner"]] == "competitor"
+                marker = " 🔴" if is_competitor else ""
+                ht_rows.append([
+                    f"#{tag}",
+                    f"@{p['owner']}{marker}",
+                    str(p["likes"]),
+                    str(p["comments"]),
+                    p["caption"][:70]
+                ])
+        t = Table([[Paragraph(x, thdr) if i == 0 and isinstance(x, str) else Paragraph(str(x), tcell)
+                    for x in row] for i, row in enumerate(ht_rows)],
+                  colWidths=[3.5 * cm, 4 * cm, 1.5 * cm, 1.5 * cm, 7 * cm])
+        t.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#CA8A04")),
+            ("GRID", (0, 0), (-1, -1), 0.2, HAIR),
+            ("FONTSIZE", (0, 0), (-1, -1), 7),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, LIGHT_BG]),
+        ]))
+        story.append(t)
+
     doc.build(story)
 
 
@@ -332,8 +577,36 @@ def main():
     w_top3, w_fmt, _ = compute_insights(w_data)
     m_top3, m_fmt, _ = compute_insights(m_data)
 
+    # Detail layers (competitor only untuk cost control)
+    competitors = [u for u, s in ROSTER.items() if s == "competitor"]
+    reels_detail = fetch_reels_metrics(competitors)
+
+    # Top 5 post URL cross-competitor untuk comments fetch
+    competitor_posts_30d = []
+    for d in m_data:
+        if d["status"] == "competitor":
+            for p in d["posts_window"]:
+                competitor_posts_30d.append({**p, "username": d["username"]})
+    top_post_urls = [p["url"] for p in
+                     sorted(competitor_posts_30d,
+                            key=lambda p: p["likes"] + p["comments"],
+                            reverse=True)[:TOP_POSTS_FOR_COMMENTS]]
+    comments_detail = fetch_post_comments(top_post_urls)
+
+    # Hashtag (monthly only)
+    hashtag_detail = fetch_hashtag_stats(HASHTAGS)
+
     # Summary
     summary = build_discord_summary((w_data, w_top3, w_fmt), (m_data, m_top3, m_fmt))
+    if reels_detail:
+        summary += f"\n🎬 Reels analyzed: {sum(len(v) for v in reels_detail.values())} reels across {len(reels_detail)} competitors"
+    if comments_detail:
+        total_comments = sum(len(v) for v in comments_detail.values())
+        leads = sum(1 for v in comments_detail.values() for c in v if c["sentiment"] == "lead")
+        summary += f"\n💬 Comments: {total_comments} analyzed · {leads} potential lead signals detected"
+    if hashtag_detail:
+        summary += f"\n🏷️ Hashtag stats: {len(hashtag_detail)} hashtag tracked (monthly)"
+
     print("\n--- SUMMARY ---")
     print(summary)
     print("---\n")
@@ -341,17 +614,25 @@ def main():
     # PDFs
     w_pdf = f"ig-weekly-audit-{RUN_DATE}.pdf"
     m_pdf = f"ig-monthly-audit-{RUN_DATE}.pdf"
-    build_pdf(w_data, w_top3, 7, "Weekly Audit", w_pdf)
+    build_pdf(w_data, w_top3, 7, "Weekly Audit", w_pdf,
+              reels_detail=reels_detail, comments_detail=comments_detail)
     print(f"Weekly PDF built: {w_pdf}")
-    build_pdf(m_data, m_top3, 30, "Monthly Rolling Audit", m_pdf)
+    build_pdf(m_data, m_top3, 30, "Monthly Rolling Audit", m_pdf,
+              reels_detail=reels_detail, comments_detail=comments_detail,
+              hashtag_detail=hashtag_detail)
     print(f"Monthly PDF built: {m_pdf}")
 
-    # Snapshots
+    # Snapshots — include detail layers
     for label, dat in [("weekly", w_data), ("monthly", m_data)]:
         sp = f"snapshot-{label}-{RUN_DATE}.json"
         with open(sp, "w") as f:
-            json.dump({"run_date": RUN_DATE, "window": label, "accounts": dat},
-                      f, indent=2, default=str)
+            json.dump({
+                "run_date": RUN_DATE, "window": label,
+                "accounts": dat,
+                "reels_detail": reels_detail,
+                "comments_detail": comments_detail,
+                "hashtag_detail": hashtag_detail if label == "monthly" else {},
+            }, f, indent=2, default=str)
         print(f"Snapshot saved: {sp}")
 
     # Post both PDFs in one Discord message
