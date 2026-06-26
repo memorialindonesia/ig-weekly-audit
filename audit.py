@@ -572,17 +572,24 @@ def post_discord_combined(summary, pdf_paths):
 def post_to_notion(w_data, w_top3, m_data, m_top3, m_fmt,
                    reels_detail, comments_detail, hashtag_detail, summary):
     """Kirim 1 row ringkasan per run ke Notion database.
-    No-op (skip aman) kalau NOTION_TOKEN / NOTION_DATABASE_ID tidak diset —
-    audit & Discord tetap jalan normal."""
+
+    ADAPTIF: baca skema database dulu, cocokkan nama kolom secara longgar
+    (abaikan spasi & kapital), kirim tiap nilai sesuai tipe kolom asli, dan
+    LEWATI kolom yang tidak ada — jadi tidak gagal karena beda nama/tipe.
+    No-op (skip aman) kalau NOTION_TOKEN / NOTION_DATABASE_ID tidak diset."""
     token = os.environ.get("NOTION_TOKEN")
     db_id = os.environ.get("NOTION_DATABASE_ID")
     if not token or not db_id:
         print("Notion skip — NOTION_TOKEN / NOTION_DATABASE_ID tidak diset")
         return
 
-    def rt(s):
-        return {"rich_text": [{"text": {"content": (s or "-")[:1900]}}]}
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Notion-Version": "2022-06-28",
+        "Content-Type": "application/json",
+    }
 
+    # ── Hitung nilai mentah per kolom ─────────────────────────────
     w_top = max(w_data, key=lambda d: d["eng_window"], default=None)
     m_top = max(m_data, key=lambda d: d["eng_window"], default=None)
     top_akun_7d = f"@{w_top['username']} ({w_top['eng_window']} eng)" if w_top else "-"
@@ -606,31 +613,80 @@ def post_to_notion(w_data, w_top3, m_data, m_top3, m_fmt,
     leads_n = sum(1 for v in comments_detail.values() for c in v
                   if c["sentiment"] == "lead") if comments_detail else 0
 
-    props = {
-        "Run":               {"title": [{"text": {"content": f"IG Audit {RUN_DATE}"}}]},
-        "Run Date":          {"date": {"start": RUN_DATE}},
-        "Top Akun 7d":       rt(top_akun_7d),
-        "Top Post 7d":       rt(top_post_7d),
-        "Top Akun 30d":      rt(top_akun_30d),
-        "Format Winner 30d": rt(fmt_winner),
-        "Dormant Count":     {"number": len(dormant)},
-        "Dormant Akun":      rt(dormant_names),
-        "Reels Analyzed":    {"number": reels_n},
-        "Lead Signals":      {"number": leads_n},
-        "Hashtag Run":       {"checkbox": bool(hashtag_detail)},
-        "Summary":           rt(summary),
+    # Nama kolom yang DIINGINKAN -> nilai mentah (Python)
+    intended = {
+        "Run":               f"IG Audit {RUN_DATE}",
+        "Run Date":          RUN_DATE,
+        "Top Akun 7d":       top_akun_7d,
+        "Top Post 7d":       top_post_7d,
+        "Top Akun 30d":      top_akun_30d,
+        "Format Winner 30d": fmt_winner,
+        "Dormant Count":     len(dormant),
+        "Dormant Akun":      dormant_names,
+        "Reels Analyzed":    reels_n,
+        "Lead Signals":      leads_n,
+        "Hashtag Run":       bool(hashtag_detail),
+        "Summary":           summary,
     }
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Notion-Version": "2022-06-28",
-        "Content-Type": "application/json",
-    }
+
+    # ── Baca skema database asli ──────────────────────────────────
+    try:
+        dbr = requests.get(f"https://api.notion.com/v1/databases/{db_id}",
+                           headers=headers, timeout=60)
+        dbr.raise_for_status()
+        schema = dbr.json().get("properties", {})
+    except Exception as e:
+        resp = getattr(e, "response", None)
+        print(f"⚠ Notion gagal baca skema: {e}" + (f" — {resp.text}" if resp is not None else ""))
+        return
+
+    # normalized name -> (nama asli, tipe)
+    norm = {name.strip().lower(): (name, meta.get("type"))
+            for name, meta in schema.items()}
+
+    def build_value(ptype, val):
+        if ptype == "title":
+            return {"title": [{"text": {"content": str(val)[:2000]}}]}
+        if ptype == "rich_text":
+            return {"rich_text": [{"text": {"content": str(val)[:1900]}}]}
+        if ptype == "number":
+            try:
+                return {"number": float(val)}
+            except (TypeError, ValueError):
+                return None
+        if ptype == "date":
+            return {"date": {"start": str(val)}}
+        if ptype == "checkbox":
+            return {"checkbox": bool(val)}
+        if ptype == "select":
+            return {"select": {"name": str(val)[:100]}}
+        if ptype == "status":
+            return {"status": {"name": str(val)[:100]}}
+        return None  # tipe tak didukung -> skip
+
+    props, missing = {}, []
+    for name, val in intended.items():
+        hit = norm.get(name.strip().lower())
+        if not hit:
+            missing.append(name)
+            continue
+        real_name, ptype = hit
+        payload_val = build_value(ptype, val)
+        if payload_val is not None:
+            props[real_name] = payload_val
+
+    if not props:
+        print("⚠ Notion: tidak ada kolom yang cocok dengan database, batal.")
+        return
+    if missing:
+        print(f"Notion: kolom tidak ditemukan (di-skip): {', '.join(missing)}")
+
     try:
         r = requests.post("https://api.notion.com/v1/pages", headers=headers,
                           json={"parent": {"database_id": db_id}, "properties": props},
                           timeout=60)
         r.raise_for_status()
-        print(f"Notion OK: row dibuat untuk {RUN_DATE}")
+        print(f"Notion OK: row dibuat untuk {RUN_DATE} ({len(props)} kolom terisi)")
     except Exception as e:
         resp = getattr(e, "response", None)
         print(f"⚠ Notion gagal: {e}" + (f" — {resp.text}" if resp is not None else ""))
