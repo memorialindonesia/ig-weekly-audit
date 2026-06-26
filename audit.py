@@ -14,13 +14,18 @@ Pipeline:
 4. (Monthly only) Fetch hashtag stats (apify/instagram-hashtag-scraper) — 5 key hashtags
 5. Filter dua kali: posts dalam 7d + 30d window
 6. Generate 2 PDF (weekly + monthly), POST ke Discord webhook
-7. Archive snapshots sebagai GitHub Actions artifact
+7. Kirim ringkasan 1 row ke Notion database
+8. Archive snapshots sebagai GitHub Actions artifact
 
 Cost: ~$17/bulan (4 weekly runs + 1 hashtag run)
 
 Required env vars:
 - APIFY_TOKEN: dari https://console.apify.com/account/integrations
 - DISCORD_WEBHOOK: webhook URL channel target
+
+Optional env vars (kalau diset, ringkasan dikirim ke Notion):
+- NOTION_TOKEN: Internal Integration Secret dari notion.so/my-integrations
+- NOTION_DATABASE_ID: 32-char ID database "IG Audit Log"
 
 Run locally: python audit.py
 """
@@ -564,6 +569,73 @@ def post_discord_combined(summary, pdf_paths):
             h.close()
 
 
+def post_to_notion(w_data, w_top3, m_data, m_top3, m_fmt,
+                   reels_detail, comments_detail, hashtag_detail, summary):
+    """Kirim 1 row ringkasan per run ke Notion database.
+    No-op (skip aman) kalau NOTION_TOKEN / NOTION_DATABASE_ID tidak diset —
+    audit & Discord tetap jalan normal."""
+    token = os.environ.get("NOTION_TOKEN")
+    db_id = os.environ.get("NOTION_DATABASE_ID")
+    if not token or not db_id:
+        print("Notion skip — NOTION_TOKEN / NOTION_DATABASE_ID tidak diset")
+        return
+
+    def rt(s):
+        return {"rich_text": [{"text": {"content": (s or "-")[:1900]}}]}
+
+    w_top = max(w_data, key=lambda d: d["eng_window"], default=None)
+    m_top = max(m_data, key=lambda d: d["eng_window"], default=None)
+    top_akun_7d = f"@{w_top['username']} ({w_top['eng_window']} eng)" if w_top else "-"
+    top_akun_30d = f"@{m_top['username']} ({m_top['eng_window']} eng)" if m_top else "-"
+
+    if w_top3:
+        t = w_top3[0]
+        top_post_7d = f"@{t['account']} {t['format'].upper()} — {t['likes']}/{t['comments']}"
+    else:
+        top_post_7d = "-"
+
+    fmt_winner = "-"
+    if m_fmt.get("reel") and m_fmt.get("static"):
+        r_avg, s_avg = m_fmt["reel"]["avg"], m_fmt["static"]["avg"]
+        ratio = r_avg / s_avg if s_avg else 0
+        fmt_winner = f"Reel {r_avg:.1f} vs Static {s_avg:.1f} ({ratio:.1f}x)"
+
+    dormant = [d for d in m_data if not d["posts_window"]]
+    dormant_names = ", ".join("@" + d["username"] for d in dormant) or "-"
+    reels_n = sum(len(v) for v in reels_detail.values()) if reels_detail else 0
+    leads_n = sum(1 for v in comments_detail.values() for c in v
+                  if c["sentiment"] == "lead") if comments_detail else 0
+
+    props = {
+        "Run":               {"title": [{"text": {"content": f"IG Audit {RUN_DATE}"}}]},
+        "Run Date":          {"date": {"start": RUN_DATE}},
+        "Top Akun 7d":       rt(top_akun_7d),
+        "Top Post 7d":       rt(top_post_7d),
+        "Top Akun 30d":      rt(top_akun_30d),
+        "Format Winner 30d": rt(fmt_winner),
+        "Dormant Count":     {"number": len(dormant)},
+        "Dormant Akun":      rt(dormant_names),
+        "Reels Analyzed":    {"number": reels_n},
+        "Lead Signals":      {"number": leads_n},
+        "Hashtag Run":       {"checkbox": bool(hashtag_detail)},
+        "Summary":           rt(summary),
+    }
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Notion-Version": "2022-06-28",
+        "Content-Type": "application/json",
+    }
+    try:
+        r = requests.post("https://api.notion.com/v1/pages", headers=headers,
+                          json={"parent": {"database_id": db_id}, "properties": props},
+                          timeout=60)
+        r.raise_for_status()
+        print(f"Notion OK: row dibuat untuk {RUN_DATE}")
+    except Exception as e:
+        resp = getattr(e, "response", None)
+        print(f"⚠ Notion gagal: {e}" + (f" — {resp.text}" if resp is not None else ""))
+
+
 def main():
     print(f"Run date: {RUN_DATE} WIB")
     print(f"Fetching {len(ROSTER)} profiles from Apify (resultsLimit={APIFY_RESULTS_LIMIT})...")
@@ -635,76 +707,13 @@ def main():
             }, f, indent=2, default=str)
         print(f"Snapshot saved: {sp}")
 
+    # Kirim ringkasan ke Notion (no-op kalau env var kosong)
+    post_to_notion(w_data, w_top3, m_data, m_top3, m_fmt,
+                   reels_detail, comments_detail, hashtag_detail, summary)
+
     # Post both PDFs in one Discord message
     post_discord_combined(summary, [w_pdf, m_pdf])
 
 
 if __name__ == "__main__":
     main()
-"""
-One-time setup: buat database Notion "IG Audit Log" pakai integration token
-yang SAMA dengan yang dipakai GitHub Action.
-
-Kenapa skrip ini (bukan bikin manual di Notion / via connector lain):
-DB yang dibuat token ini otomatis dimiliki integration ini, jadi audit.py
-langsung bisa nulis ke sana tanpa langkah "share to integration" terpisah.
-
-Jalankan SEKALI di laptop:
-    pip install requests
-    export NOTION_TOKEN="secret_xxx"            # token integration (Internal)
-    export NOTION_PARENT_PAGE_ID="xxxxxxxx"     # ID page induk yang sudah di-share ke integration
-    python setup_notion.py
-
-Output: NOTION_DATABASE_ID — copy ke GitHub Secret.
-
-Cara dapat NOTION_PARENT_PAGE_ID:
-  Buat 1 page kosong di Notion (mis. "Marketing Ops"), klik ... > Connections >
-  add integration kamu. Lalu copy ID dari URL page: bagian 32 karakter terakhir
-  sebelum '?', contoh notion.so/Marketing-Ops-1a2b3c... -> ID = 1a2b3c...
-"""
-import os
-import sys
-import requests
-
-TOKEN = os.environ.get("NOTION_TOKEN")
-PARENT = os.environ.get("NOTION_PARENT_PAGE_ID")
-
-if not TOKEN or not PARENT:
-    sys.exit("Set NOTION_TOKEN dan NOTION_PARENT_PAGE_ID dulu (lihat docstring).")
-
-HEADERS = {
-    "Authorization": f"Bearer {TOKEN}",
-    "Notion-Version": "2022-06-28",
-    "Content-Type": "application/json",
-}
-
-# Skema kolom — HARUS sama persis dengan yang dipakai post_to_notion() di audit.py
-PROPERTIES = {
-    "Run":               {"title": {}},
-    "Run Date":          {"date": {}},
-    "Top Akun 7d":       {"rich_text": {}},
-    "Top Post 7d":       {"rich_text": {}},
-    "Top Akun 30d":      {"rich_text": {}},
-    "Format Winner 30d": {"rich_text": {}},
-    "Dormant Count":     {"number": {}},
-    "Dormant Akun":      {"rich_text": {}},
-    "Reels Analyzed":    {"number": {}},
-    "Lead Signals":      {"number": {}},
-    "Hashtag Run":       {"checkbox": {}},
-    "Summary":           {"rich_text": {}},
-}
-
-payload = {
-    "parent": {"type": "page_id", "page_id": PARENT},
-    "title": [{"type": "text", "text": {"content": "IG Audit Log (Weekly + Monthly)"}}],
-    "properties": PROPERTIES,
-}
-
-r = requests.post("https://api.notion.com/v1/databases", headers=HEADERS, json=payload, timeout=60)
-if r.status_code != 200:
-    sys.exit(f"Gagal ({r.status_code}): {r.text}")
-
-db_id = r.json()["id"].replace("-", "")
-print("\n✅ Database dibuat.")
-print(f"NOTION_DATABASE_ID = {db_id}")
-print("\nLangkah berikut: masukkan ini ke GitHub Secret 'NOTION_DATABASE_ID'.")
