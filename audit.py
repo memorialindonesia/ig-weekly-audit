@@ -641,3 +641,70 @@ def main():
 
 if __name__ == "__main__":
     main()
+"""
+One-time setup: buat database Notion "IG Audit Log" pakai integration token
+yang SAMA dengan yang dipakai GitHub Action.
+
+Kenapa skrip ini (bukan bikin manual di Notion / via connector lain):
+DB yang dibuat token ini otomatis dimiliki integration ini, jadi audit.py
+langsung bisa nulis ke sana tanpa langkah "share to integration" terpisah.
+
+Jalankan SEKALI di laptop:
+    pip install requests
+    export NOTION_TOKEN="secret_xxx"            # token integration (Internal)
+    export NOTION_PARENT_PAGE_ID="xxxxxxxx"     # ID page induk yang sudah di-share ke integration
+    python setup_notion.py
+
+Output: NOTION_DATABASE_ID — copy ke GitHub Secret.
+
+Cara dapat NOTION_PARENT_PAGE_ID:
+  Buat 1 page kosong di Notion (mis. "Marketing Ops"), klik ... > Connections >
+  add integration kamu. Lalu copy ID dari URL page: bagian 32 karakter terakhir
+  sebelum '?', contoh notion.so/Marketing-Ops-1a2b3c... -> ID = 1a2b3c...
+"""
+import os
+import sys
+import requests
+
+TOKEN = os.environ.get("NOTION_TOKEN")
+PARENT = os.environ.get("NOTION_PARENT_PAGE_ID")
+
+if not TOKEN or not PARENT:
+    sys.exit("Set NOTION_TOKEN dan NOTION_PARENT_PAGE_ID dulu (lihat docstring).")
+
+HEADERS = {
+    "Authorization": f"Bearer {TOKEN}",
+    "Notion-Version": "2022-06-28",
+    "Content-Type": "application/json",
+}
+
+# Skema kolom — HARUS sama persis dengan yang dipakai post_to_notion() di audit.py
+PROPERTIES = {
+    "Run":               {"title": {}},
+    "Run Date":          {"date": {}},
+    "Top Akun 7d":       {"rich_text": {}},
+    "Top Post 7d":       {"rich_text": {}},
+    "Top Akun 30d":      {"rich_text": {}},
+    "Format Winner 30d": {"rich_text": {}},
+    "Dormant Count":     {"number": {}},
+    "Dormant Akun":      {"rich_text": {}},
+    "Reels Analyzed":    {"number": {}},
+    "Lead Signals":      {"number": {}},
+    "Hashtag Run":       {"checkbox": {}},
+    "Summary":           {"rich_text": {}},
+}
+
+payload = {
+    "parent": {"type": "page_id", "page_id": PARENT},
+    "title": [{"type": "text", "text": {"content": "IG Audit Log (Weekly + Monthly)"}}],
+    "properties": PROPERTIES,
+}
+
+r = requests.post("https://api.notion.com/v1/databases", headers=HEADERS, json=payload, timeout=60)
+if r.status_code != 200:
+    sys.exit(f"Gagal ({r.status_code}): {r.text}")
+
+db_id = r.json()["id"].replace("-", "")
+print("\n✅ Database dibuat.")
+print(f"NOTION_DATABASE_ID = {db_id}")
+print("\nLangkah berikut: masukkan ini ke GitHub Secret 'NOTION_DATABASE_ID'.")
