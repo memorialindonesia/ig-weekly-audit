@@ -613,10 +613,31 @@ def post_to_notion(w_data, w_top3, m_data, m_top3, m_fmt,
     leads_n = sum(1 for v in comments_detail.values() for c in v
                   if c["sentiment"] == "lead") if comments_detail else 0
 
+    # Blok teks per-window untuk kolom "7 Hari Terakhir" & "30 Hari Terakhir"
+    def _window_text(data, top3, label):
+        L = [label]
+        for d in sorted(data, key=lambda x: x["eng_window"], reverse=True)[:3]:
+            em = {"corporate": "🏢", "agent": "👥", "competitor": "🔴"}[d["status"]]
+            L.append(f"{em} @{d['username']} — {d['eng_window']} eng / "
+                     f"{len(d['posts_window'])} posts (ER {d['er']:.2f}%)")
+        if top3:
+            t = top3[0]
+            L.append(f"🏆 Top: @{t['account']} {t['format'].upper()} — "
+                     f"{t['likes']}♥/{t['comments']}💬")
+            L.append(t["caption"][:100])
+        return "\n".join(L)[:1900]
+
+    text_7d = _window_text(w_data, w_top3, "📅 7 HARI TERAKHIR")
+    text_30d = _window_text(m_data, m_top3, "🗓️ 30 HARI TERAKHIR")
+    if fmt_winner != "-":
+        text_30d = (text_30d + f"\n📈 Format: {fmt_winner}")[:1900]
+
     # Nama kolom yang DIINGINKAN -> nilai mentah (Python)
     intended = {
         "Run":               f"IG Audit {RUN_DATE}",
         "Run Date":          RUN_DATE,
+        "7 Hari Terakhir":   text_7d,
+        "30 Hari Terakhir":  text_30d,
         "Top Akun 7d":       top_akun_7d,
         "Top Post 7d":       top_post_7d,
         "Top Akun 30d":      top_akun_30d,
