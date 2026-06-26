@@ -2,9 +2,10 @@ name: IG Audit (Weekly + Monthly Rolling)
 
 on:
   schedule:
-    # Senin 02:00 UTC = 09:00 WIB
-   - cron: '0 18 * * 0'
-     workflow_dispatch:  # manual trigger via GitHub UI
+    # '0 18 * * 0' = Minggu 18:00 UTC = Senin 01:00 WIB.
+    # CATATAN: komentar lama bilang 09:00 WIB — itu butuh '0 2 * * 1'. Cek mana yang kamu mau.
+    - cron: '0 18 * * 0'
+  workflow_dispatch:        # manual trigger via GitHub UI
 
 jobs:
   audit:
@@ -25,6 +26,8 @@ jobs:
         env:
           APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
         run: python audit.py
 
       - name: Archive snapshots + PDFs
