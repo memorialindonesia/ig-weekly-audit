@@ -1,5 +1,5 @@
 """
-IG Audit — runs in GitHub Actions every Monday 09:00 WIB.
+IG Audit — runs in GitHub Actions every Monday 01:00 WIB.
 
 Single trigger, dual report + detail layers:
 - Weekly (7d window) — what happened minggu lalu
