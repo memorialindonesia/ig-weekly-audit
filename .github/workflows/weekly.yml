@@ -5,7 +5,10 @@ on:
     # '0 18 * * 0' = Minggu 18:00 UTC = Senin 01:00 WIB.
     # CATATAN: komentar lama bilang 09:00 WIB — itu butuh '0 2 * * 1'. Cek mana yang kamu mau.
     - cron: '0 18 * * 0'
-  workflow_dispatch:        # manual trigger via GitHub UI
+  workflow_dispatch:   # manual trigger via GitHub UI
+
+permissions:
+  contents: write      # dibutuhkan step keepalive untuk push commit
 
 jobs:
   audit:
@@ -41,3 +44,18 @@ jobs:
             snapshot-weekly-*.json
             snapshot-monthly-*.json
           retention-days: 365
+
+      # ------------------------------------------------------------------
+      # KEEPALIVE — mencegah GitHub auto-disable cron setelah 60 hari
+      # tanpa aktivitas commit di repo. Jalan walau audit gagal.
+      # Commit pakai GITHUB_TOKEN tidak men-trigger workflow lagi (no loop).
+      # ------------------------------------------------------------------
+      - name: Keepalive (cegah auto-disable 60 hari)
+        if: always()
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          date -u +"%Y-%m-%dT%H:%M:%SZ" > .keepalive
+          git add .keepalive
+          git commit -m "chore: keepalive $(date -u +%Y-%m-%d) [skip ci]" || exit 0
+          git push
