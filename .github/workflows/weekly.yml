@@ -47,7 +47,22 @@ jobs:
             snapshot-weekly-*.json
             snapshot-monthly-*.json
           retention-days: 365
-
+      # ------------------------------------------------------------------
+      # FAILURE NOTIFICATION — ping Discord kalau audit gagal, supaya
+      # tahu hari itu juga, bukan 2 minggu kemudian saat baru buka repo.
+      # Hanya jalan kalau ada step sebelumnya yang failed.
+      # ------------------------------------------------------------------
+      - name: Notify Discord on failure
+        if: failure()
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+        run: |
+          RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          curl -X POST "$DISCORD_WEBHOOK" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"content\": \"🚨 **ig-weekly-audit FAIL** — run <$RUN_URL> gagal. Cek log, kemungkinan APIFY_TOKEN revoked atau Apify actor error.\"
+            }"
       # ------------------------------------------------------------------
       # KEEPALIVE — mencegah GitHub auto-disable cron setelah 60 hari
       # tanpa aktivitas commit di repo. Jalan walau audit gagal.
